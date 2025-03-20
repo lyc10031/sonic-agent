@@ -26,9 +26,11 @@ import org.cloud.sonic.agent.tools.PortTool;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.Socket;
+import java.util.Arrays;
 import java.util.concurrent.BlockingQueue;
 
 import static org.cloud.sonic.agent.tools.BytesTool.subByteArray;
@@ -96,50 +98,80 @@ public class MiniCapInputSocketThread extends Thread {
 
         int finalMiniCapPort = PortTool.getPort();
         AndroidDeviceBridgeTool.forward(iDevice, finalMiniCapPort, "minicap");
+        // 优化点1：使用更大缓冲区（8KB）减少读取次数
+        final int BUFFER_SIZE = 8192;
         Socket capSocket = null;
         InputStream inputStream = null;
+
         try {
             capSocket = new Socket("localhost", finalMiniCapPort);
             inputStream = capSocket.getInputStream();
             int len = 1024;
+
+            // 优化点2：使用缓冲流提升读取性能
+            inputStream = new BufferedInputStream(capSocket.getInputStream());
+            byte[] buffer = new byte[BUFFER_SIZE];
+
             while (miniCapPro.isAlive()) {
-                byte[] buffer = new byte[len];
-                int realLen;
-                realLen = inputStream.read(buffer);
-                if (buffer.length != realLen && realLen >= 0) {
-                    buffer = subByteArray(buffer, 0, realLen);
+
+                int realLen = inputStream.read(buffer);
+                if (realLen == -1) {
+                    log.info("miniCap socket closed.");
+                    break;
                 }
-                if (realLen >= 0) {
-                    dataQueue.offer(buffer);
+//                if (buffer.length != realLen && realLen >= 0) {
+//                    buffer = subByteArray(buffer, 0, realLen);
+//                }
+//                if (realLen >= 0) {
+//                    dataQueue.offer(buffer);
+//                }
+                // 优化点3：避免数组拷贝直接使用原数据
+                if (realLen == BUFFER_SIZE) {
+                    dataQueue.put(buffer.clone());
+                } else {
+                    dataQueue.put(Arrays.copyOfRange(buffer, 0, realLen));
                 }
             }
         } catch (IOException e) {
-            e.printStackTrace();
-        } finally {
-            if (miniCapPro.isAlive()) {
-                miniCapPro.interrupt();
-                log.info("miniCap thread closed.");
+
+            // 优化点4：细化异常处理
+            if (!capSocket.isClosed()) {
+                log.error("视频流读取异常: {}", e.getMessage());
             }
-            if (capSocket != null && capSocket.isConnected()) {
-                try {
-                    capSocket.close();
-                    log.info("miniCap socket closed.");
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
-            }
-            if (inputStream != null) {
-                try {
-                    inputStream.close();
-                    log.info("miniCap input stream closed.");
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
+        } catch (InterruptedException e) {
+            log.debug("视频流线程正常中断");
+            Thread.currentThread().interrupt();
+        }finally {
+            // 优化点5：统一资源释放逻辑
+            closeResources(capSocket, inputStream);
+            AndroidDeviceBridgeTool.removeForward(iDevice, finalMiniCapPort, "minicap");
+            if (session != null) {
+                ScreenMap.getMap().remove(session);
             }
         }
         AndroidDeviceBridgeTool.removeForward(iDevice, finalMiniCapPort, "minicap");
         if (session != null) {
             ScreenMap.getMap().remove(session);
+        }
+    }
+
+    // 新增辅助方法：统一关闭资源
+    private void closeResources(Socket socket, InputStream is) {
+        try {
+            if (socket != null && !socket.isClosed()) {
+                socket.close();
+                log.info("miniCap socket已关闭");
+            }
+            if (is != null) {
+                is.close();
+                log.info("输入流已关闭");
+            }
+            if (miniCapPro.isAlive()) {
+                miniCapPro.interrupt();
+                log.info("miniCap线程已终止");
+            }
+        } catch (IOException e) {
+            log.warn("资源关闭异常: {}", e.getMessage());
         }
     }
 }

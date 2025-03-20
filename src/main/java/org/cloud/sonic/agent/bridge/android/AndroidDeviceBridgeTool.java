@@ -46,8 +46,10 @@ import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 import org.springframework.web.client.RestTemplate;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -333,42 +335,140 @@ public class AndroidDeviceBridgeTool implements ApplicationListener<ContextRefre
             log.error(e.getMessage());
         }
     }
+//
+//    /**
+//     * @param iDevice
+//     * @param port
+//     * @param serviceName
+//     * @return void
+//     * @author ZhouYiXun
+//     * @des 去掉转发
+//     * @date 2021/8/16 19:53
+//     */
+//    public static void removeForward(IDevice iDevice, int port, String serviceName) {
+//        try {
+//            log.info("cancel {} device {} port forward to {}", iDevice.getSerialNumber(), serviceName, port);
+//            iDevice.removeForward(port);
+//            String name = String.format("process-%s-forward-%s", iDevice.getSerialNumber(), serviceName);
+//            if (forwardPortMap.get(name) != null) {
+//                forwardPortMap.remove(name);
+//            }
+//        } catch (Exception e) {
+//            log.error(e.getMessage());
+//        }
+//    }
+//
+//    public static void removeForward(IDevice iDevice, int port, int target) {
+//        try {
+//            log.info("cancel {} device {} forward to {}", iDevice.getSerialNumber(), target, port);
+//            iDevice.removeForward(port);
+//            String name = String.format("process-%s-forward-%d", iDevice.getSerialNumber(), target);
+//            if (forwardPortMap.get(name) != null) {
+//                forwardPortMap.remove(name);
+//            }
+//        } catch (Exception e) {
+//            log.error(e.getMessage());
+//        }
+//    }
+
 
     /**
-     * @param iDevice
-     * @param port
-     * @param serviceName
-     * @return void
-     * @author ZhouYiXun
-     * @des 去掉转发
-     * @date 2021/8/16 19:53
+     * 执行ADB命令移除端口转发
      */
-    public static void removeForward(IDevice iDevice, int port, String serviceName) {
+    private static void executeAdbForwardRemove(IDevice device, int port) {
+        String[] command = new String[]{
+                getADBPathFromSystemEnv(),
+                "-s", device.getSerialNumber(),
+                "forward", "--remove", "tcp:" + port
+        };
+        log.info("执行ADB命令移除端口转发 | 设备:{} | 端口:{} | 命令:{}",
+                device.getSerialNumber(), port, Arrays.toString(command));
         try {
-            log.info("cancel {} device {} port forward to {}", iDevice.getSerialNumber(), serviceName, port);
-            iDevice.removeForward(port);
-            String name = String.format("process-%s-forward-%s", iDevice.getSerialNumber(), serviceName);
-            if (forwardPortMap.get(name) != null) {
-                forwardPortMap.remove(name);
+            Process process = new ProcessBuilder(command).start();
+            boolean finished = process.waitFor(3, TimeUnit.SECONDS);
+
+            if (finished && process.exitValue() == 0) {
+                log.debug("ADB移除成功 | 设备:{} | 端口:{}", device.getSerialNumber(), port);
+            } else {
+                if (!finished) {
+                    process.destroyForcibly();
+                    log.error("ADB命令超时 | 设备:{} | 端口:{}", device.getSerialNumber(), port);
+                } else {
+                    log.warn("ADB移除失败 | 设备:{} | 退出码:{}",
+                            device.getSerialNumber(), process.exitValue());
+                }
             }
+        } catch (IOException | InterruptedException e) {
+            log.error("ADB命令异常 | 设备:{} | 类型:{} | 信息:{}",
+                    device.getSerialNumber(), e.getClass().getSimpleName(), e.getMessage());
+        }
+    }
+
+    /**
+     * 统一端口移除逻辑（优化后的方法）
+     */
+    private static void removeForwardInternal(IDevice device, int port,String mapKey, String logTarget) {
+        final String deviceId = device.getSerialNumber();
+//        final String mapKey = String.format("process-%s-forward-%s", deviceId, logTarget);
+
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            try {
+                if (device.isOnline()) {
+                    device.removeForward(port); // 优先使用DDMLIB API
+                    forwardPortMap.remove(mapKey);
+                    log.info("端口移除成功 | 设备:{} | 标识:{}", deviceId, logTarget);
+                    return;
+                }
+//                log.warn("设备离线 | 设备:{} | 终止操作", deviceId);
+                break;
+            } catch (Exception ddmlibEx) {
+//                log.warn("DDMLIB移除失败 | 设备:{} | 尝试:{}/3 | 错误:{}",
+//                        deviceId, attempt, ddmlibEx.getMessage());
+
+                // 回退到ADB命令
+                executeAdbForwardRemove(device, port);
+                if (!forwardPortMap.containsKey(mapKey)) break;
+
+                try {
+                    Thread.sleep((long) Math.pow(2, attempt) * 100);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            } finally {
+                forwardPortMap.remove(mapKey); // 确保最终清理
+            }
+        }
+//        log.error("端口移除失败 | 设备:{} | 标识:{}", deviceId, logTarget);
+    }
+
+    public static void removeForward(IDevice iDevice, int port, String serviceName) {
+        String mapKey = String.format("process-%s-forward-%s",
+                iDevice.getSerialNumber(), serviceName);
+        String logTarget = String.format("服务:%s → 端口:%d", serviceName, port);
+
+        try {
+            log.info("取消端口转发 | 设备:{} | {}", iDevice.getSerialNumber(), logTarget);
+            removeForwardInternal(iDevice, port, mapKey, logTarget);
         } catch (Exception e) {
-            log.error(e.getMessage());
+            log.error("最终异常 | 设备:{} | {} | 错误:{}",
+                    iDevice.getSerialNumber(), logTarget, e.getMessage());
         }
     }
 
     public static void removeForward(IDevice iDevice, int port, int target) {
+        String mapKey = String.format("process-%s-forward-%d",
+                iDevice.getSerialNumber(), target);
+        String logTarget = String.format("目标端口:%d → 本地端口:%d", target, port);
+
         try {
-            log.info("cancel {} device {} forward to {}", iDevice.getSerialNumber(), target, port);
-            iDevice.removeForward(port);
-            String name = String.format("process-%s-forward-%d", iDevice.getSerialNumber(), target);
-            if (forwardPortMap.get(name) != null) {
-                forwardPortMap.remove(name);
-            }
+            log.info("取消端口转发 | 设备:{} | {}", iDevice.getSerialNumber(), logTarget);
+            removeForwardInternal(iDevice, port, mapKey, logTarget);
         } catch (Exception e) {
-            log.error(e.getMessage());
+            log.error("最终异常 | 设备:{} | {} | 错误:{}",
+                    iDevice.getSerialNumber(), logTarget, e.getMessage());
         }
     }
-
     /**
      * @param iDevice
      * @param localPath

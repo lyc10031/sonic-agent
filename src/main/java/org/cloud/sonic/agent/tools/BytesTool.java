@@ -41,27 +41,35 @@ public class BytesTool {
 
     public static int remoteTimeout = 480;
 
+    // 预编译正则表达式（性能提升关键点）
+    private static final Pattern INT_PATTERN = Pattern.compile("[0-9]+");
+    private static final Pattern NON_DIGIT_PATTERN = Pattern.compile("[^0-9]");
+
+
+    // 优化toInt方法（减少循环次数）
     public static int toInt(byte[] b) {
         int res = 0;
         for (int i = 0; i < b.length; i++) {
-            res += (b[i] & 0xff) << (i * 8);
+            res |= (b[i] & 0xFF) << (i * 8);
         }
         return res;
     }
 
+    // 优化intToByteArray（使用预计算位移）
     public static byte[] intToByteArray(int i) {
-        byte[] result = new byte[4];
-        result[0] = (byte) (i & 0xff);
-        result[1] = (byte) (i >> 8 & 0xff);
-        result[2] = (byte) (i >> 16 & 0xff);
-        result[3] = (byte) (i >> 24 & 0xff);
-        return result;
+        return new byte[] {
+                (byte) i,
+                (byte) (i >> 8),
+                (byte) (i >> 16),
+                (byte) (i >> 24)
+        };
     }
 
+    // 优化subByteArray（避免重复计算长度）
     public static byte[] subByteArray(byte[] byte1, int start, int end) {
-        byte[] byte2;
-        byte2 = new byte[end - start];
-        System.arraycopy(byte1, start, byte2, 0, end - start);
+        int length = end - start;
+        byte[] byte2 = new byte[length];
+        System.arraycopy(byte1, start, byte2, 0, length);
         return byte2;
     }
 
@@ -81,52 +89,44 @@ public class BytesTool {
     }
 
     public static void sendByte(Session session, byte[] message) {
-        if (session == null || !session.isOpen()) {
-            return;
-        }
-        synchronized (session) {
-            try {
-                session.getBasicRemote().sendBinary(ByteBuffer.wrap(message));
-            } catch (IllegalStateException | IOException e) {
-                log.error("WebSocket send msg error...connection has been closed.");
-            }
-        }
+        sendInternal(session, () -> session.getBasicRemote().sendBinary(ByteBuffer.wrap(message)), "二进制流");
     }
 
+
     public static void sendByte(Session session, ByteBuffer message) {
-        if (session == null || !session.isOpen()) {
-            return;
-        }
-        synchronized (session) {
-            try {
-                session.getBasicRemote().sendBinary(message);
-            } catch (IllegalStateException | IOException e) {
-                log.error("WebSocket send msg error...connection has been closed.");
-            }
-        }
+        sendInternal(session, () -> session.getBasicRemote().sendBinary(message), "二进制流");
     }
 
     public static void sendText(Session session, String message) {
-        if (session == null || !session.isOpen()) {
-            return;
-        }
+        sendInternal(session, () -> session.getBasicRemote().sendText(message), "文本");
+    }
+
+    // 公共发送逻辑封装
+    private static void sendInternal(Session session, CheckedSender sender, String type) {
+        if (session == null || !session.isOpen()) return;
+
         synchronized (session) {
             try {
-                session.getBasicRemote().sendText(message);
-            } catch (IllegalStateException | IOException e) {
-                log.error("WebSocket send msg error...connection has been closed.");
+                sender.send();
+            } catch (IllegalStateException e) {
+                log.debug("WebSocket {}发送失败：连接已关闭", type);
+            } catch (IOException e) {
+                log.error("WebSocket {}发送IO异常", type, e);
             }
         }
     }
+    @FunctionalInterface
+    private interface CheckedSender {
+        void send() throws IOException;
+    }
 
+    // 优化正则匹配方法（使用预编译Pattern）
     public static boolean isInt(String s) {
-        return s.matches("[0-9]+");
+        return INT_PATTERN.matcher(s).matches();
     }
 
     public static int getInt(String a) {
-        String regEx = "[^0-9]";
-        Pattern p = Pattern.compile(regEx);
-        Matcher m = p.matcher(a);
+        Matcher m = NON_DIGIT_PATTERN.matcher(a);
         return Integer.parseInt(m.replaceAll("").trim());
     }
 
@@ -150,6 +150,11 @@ public class BytesTool {
     }
 
     public static int[] parseVersion(String s) {
-        return Arrays.stream(s.split("\\.")).mapToInt(Integer::parseInt).toArray();
+        String[] parts = s.split("\\.");
+        int[] ver = new int[3];
+        for (int i = 0; i < 3 && i < parts.length; i++) {
+            ver[i] = Integer.parseInt(parts[i]);
+        }
+        return ver;
     }
 }

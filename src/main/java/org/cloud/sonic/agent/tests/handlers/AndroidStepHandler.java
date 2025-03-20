@@ -71,8 +71,12 @@ import org.springframework.util.CollectionUtils;
 
 import javax.imageio.stream.FileImageOutputStream;
 import java.io.File;
+import java.net.URL;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.testng.Assert.*;
 
@@ -130,10 +134,12 @@ public class AndroidStepHandler {
      * @date 2021/8/16 20:01
      */
     public void startAndroidDriver(IDevice iDevice, int uiaPort) throws Exception {
+
         this.iDevice = iDevice;
-        int retry = 0;
+//        int retry = 0;
+        final int MAX_RETRIES = 5;
         Exception out = null;
-        while (retry <= 4) {
+        for (int retry = 0; retry <= MAX_RETRIES; retry++) {
             try {
                 androidDriver = new AndroidDriver("http://127.0.0.1:" + uiaPort);
                 break;
@@ -141,7 +147,6 @@ public class AndroidStepHandler {
                 log.sendStepLog(StepType.WARN, String.format("连接 UIAutomator2 Server 失败！重试第 %d 次...", retry + 1), "");
                 out = e;
             }
-            retry++;
             Thread.sleep(2000);
         }
         if (androidDriver == null) {
@@ -153,14 +158,29 @@ public class AndroidStepHandler {
         log.sendStepLog(StepType.PASS, "连接 UIAutomator2 Server 成功", "");
 
         // 获取屏幕的宽度与高度
-        String screenSizeInfo = AndroidDeviceBridgeTool.getScreenSize(iDevice);
-        String[] winSize = screenSizeInfo.split("x");
-        screenWidth = BytesTool.getInt(winSize[0]);
-        screenHeight = BytesTool.getInt(winSize[1]);
-        log.androidInfo("Android", iDevice.getProperty(IDevice.PROP_BUILD_VERSION),
-                iDevice.getSerialNumber(), iDevice.getProperty(IDevice.PROP_DEVICE_MANUFACTURER),
-                iDevice.getProperty(IDevice.PROP_DEVICE_MODEL),
-                screenSizeInfo);
+//        String screenSizeInfo = AndroidDeviceBridgeTool.getScreenSize(iDevice);
+//        String[] winSize = screenSizeInfo.split("x");
+//        screenWidth = BytesTool.getInt(winSize[0]);
+//        screenHeight = BytesTool.getInt(winSize[1]);
+//        log.androidInfo("Android", iDevice.getProperty(IDevice.PROP_BUILD_VERSION),
+//                iDevice.getSerialNumber(), iDevice.getProperty(IDevice.PROP_DEVICE_MANUFACTURER),
+//                iDevice.getProperty(IDevice.PROP_DEVICE_MODEL),
+//                screenSizeInfo);
+
+        // 异步获取屏幕尺寸（使用统一线程池）
+        CompletableFuture.runAsync(() -> {
+            try {
+                String screenSizeInfo = AndroidDeviceBridgeTool.getScreenSize(iDevice);
+                String[] winSize = screenSizeInfo.split("x");
+                screenWidth = BytesTool.getInt(winSize[0]);
+                screenHeight = BytesTool.getInt(winSize[1]);
+                log.androidInfo("Android", iDevice.getProperty(IDevice.PROP_BUILD_VERSION),
+                        iDevice.getSerialNumber(), iDevice.getProperty(IDevice.PROP_DEVICE_MANUFACTURER),
+                        iDevice.getProperty(IDevice.PROP_DEVICE_MODEL), screenSizeInfo);
+            } catch (Exception e) {
+                log.sendStepLog(StepType.WARN, "获取屏幕尺寸异常", e.getMessage());
+            }
+        }, AndroidDeviceThreadPool.cachedThreadPool); // 使用项目统一线程池
     }
 
     public void switchWindowMode(HandleContext handleContext, boolean isMulti) throws SonicRespException {
