@@ -107,11 +107,32 @@ public class BytesTool {
 
         synchronized (session) {
             try {
+                // 双重检查确保连接状态
+                if (!session.isOpen()) {
+                    log.debug("连接已提前关闭，放弃发送");
+                    return;
+                }
                 sender.send();
             } catch (IllegalStateException e) {
                 log.debug("WebSocket {}发送失败：连接已关闭", type);
+                closeSession(session); // 增加关闭操作
             } catch (IOException e) {
-                log.error("WebSocket {}发送IO异常", type, e);
+                if (e.getMessage().contains("Broken pipe")) {
+                    log.warn("检测到连接中断，终止发送");
+                    closeSession(session); // 立即关闭连接
+                } else {
+                    log.error("WebSocket {}发送IO异常", type, e);
+                }
+            }
+        }
+    }
+    // 新增同步关闭方法
+    private static synchronized void closeSession(Session session) {
+        if (session != null && session.isOpen()) {
+            try {
+                session.close();
+            } catch (IOException ex) {
+                log.trace("连接已自然关闭");
             }
         }
     }

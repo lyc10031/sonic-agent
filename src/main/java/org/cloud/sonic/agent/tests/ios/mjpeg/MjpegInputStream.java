@@ -35,7 +35,7 @@ public class MjpegInputStream extends DataInputStream {
     private final byte[] EOI_MARKER = {(byte) 0xFF, (byte) 0xD9};
     private final String CONTENT_LENGTH = "Content-Length".toLowerCase();
     private final static int HEADER_MAX_LENGTH = 100;
-//    private final static int FRAME_MAX_LENGTH = 1024 * 5 + HEADER_MAX_LENGTH;
+    //    private final static int FRAME_MAX_LENGTH = 1024 * 5 + HEADER_MAX_LENGTH;
     private final static int FRAME_MAX_LENGTH = 1024 * 100 + HEADER_MAX_LENGTH;  // 调整为100KB
 
     // 新增线程局部变量用于缓存缓冲区
@@ -95,74 +95,51 @@ public class MjpegInputStream extends DataInputStream {
         }
         return 0;
     }
-//
-//    public ByteBuffer readFrameForByteBuffer() throws IOException {
-//        mark(FRAME_MAX_LENGTH);
-//        int n = getStartOfSequence(this, SOI_MARKER);
-//        reset();
-//        final byte[] header = new byte[n];
-//        readFully(header);
-//        int length;
-//        try {
-//            length = parseContentLength(header);
-//        } catch (NumberFormatException e) {
-//            length = getEndOfSequence(this, EOI_MARKER);
-//        }
-//        if (length == 0) {
-//            log.error("EOI Marker 0xFF,0xD9 not found!");
-//        }
-//        reset();
-//        final byte[] frame = new byte[length];
-//        skipBytes(n);
-//        readFully(frame);
-//        return ByteBuffer.wrap(frame);
-//    }
-public ByteBuffer readFrameForByteBuffer() throws IOException {
-    mark(FRAME_MAX_LENGTH);
-    int n = getStartOfSequence(this, SOI_MARKER);
-    reset();
-    final byte[] header = new byte[n];
-    readFully(header);
-    int length;
-    try {
-        length = parseContentLength(header);
-    } catch (NumberFormatException e) {
-        length = getEndOfSequence(this, EOI_MARKER);
-    }
-    if (length == 0) {
-        log.error("EOI Marker 0xFF,0xD9 not found!");
-    }
-    reset();
 
-    // 优化点：使用线程局部变量缓存缓冲区
-    byte[] frame = threadLocalBuffer.get();
-    if (frame == null || frame.length < length) {
+    public ByteBuffer readFrameForByteBuffer() throws IOException {
+        mark(FRAME_MAX_LENGTH);
+        int n = getStartOfSequence(this, SOI_MARKER);
+        reset();
+        final byte[] header = new byte[n];
+        readFully(header);
+        int length;
+        try {
+            length = parseContentLength(header);
+        } catch (NumberFormatException e) {
+            length = getEndOfSequence(this, EOI_MARKER);
+        }
+        if (length == 0) {
+            log.error("EOI Marker 0xFF,0xD9 not found!");
+        }
+        reset();
+
+        // 优化点：使用线程局部变量缓存缓冲区
+        byte[] frame = threadLocalBuffer.get();
+        if (frame == null || frame.length < length) {
 //        frame = new byte[Math.min(length, FRAME_MAX_LENGTH)];
 //        threadLocalBuffer.set(frame);
-        // 修复点：确保新缓冲区长度不超过预设最大值，同时满足本次读取需求
-        int bufferSize = Math.min(Math.max(length, FRAME_MAX_LENGTH), FRAME_MAX_LENGTH * 4);
-        frame = new byte[bufferSize];
-        threadLocalBuffer.set(frame);
-    }
+            // 修复点：确保新缓冲区长度不超过预设最大值，同时满足本次读取需求
+            int bufferSize = Math.min(Math.max(length, FRAME_MAX_LENGTH), FRAME_MAX_LENGTH * 4);
+            frame = new byte[bufferSize];
+            threadLocalBuffer.set(frame);
+        }
 
-    skipBytes(n);
+        skipBytes(n);
 //    readFully(frame, 0, length);
-    // 修复点：根据实际缓冲区长度调整读取量
-    int bytesToRead = Math.min(length, frame.length);
-    readFully(frame, 0, bytesToRead);
-    // 修复点：添加异常数据检测
-    if (bytesToRead < length) {
-        log.warn("Frame truncated! Expected {} bytes but only read {} bytes", length, bytesToRead);
+        // 修复点：根据实际缓冲区长度调整读取量
+        int bytesToRead = Math.min(length, frame.length);
+        readFully(frame, 0, bytesToRead);
+        // 修复点：添加异常数据检测
+        if (bytesToRead < length) {
+            log.warn("Frame truncated! Expected {} bytes but only read {} bytes", length, bytesToRead);
+        }
+
+        return ByteBuffer.wrap(frame, 0, length);
     }
-
-    return ByteBuffer.wrap(frame, 0, length);
-}
-
 
 
     @Override
     public void close() throws IOException {
         super.close();
     }
-
 }

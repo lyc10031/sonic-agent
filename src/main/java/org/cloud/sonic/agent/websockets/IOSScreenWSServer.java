@@ -51,10 +51,104 @@ public class IOSScreenWSServer implements IIOSWSServer {
     @Value("${sonic.agent.port}")
     private int port;
 
+    //    @OnOpen
+//    public void onOpen(Session session, @PathParam("key") String secretKey,
+//                       @PathParam("udId") String udId, @PathParam("token") String token) throws InterruptedException {
+//        if (secretKey.length() == 0 || (!secretKey.equals(key)) || token.length() == 0) {
+//            log.info("Auth Failed!");
+//            return;
+//        }
+//
+//        if (!SibTool.getDeviceList().contains(udId)) {
+//            log.info("Target device is not connecting, please check the connection.");
+//            return;
+//        }
+//
+//        session.getUserProperties().put("udId", udId);
+//        session.getUserProperties().put("id", String.format("%s-%s", this.getClass().getSimpleName(), udId));
+//        WebSocketSessionMap.addSession(session);
+//        saveUdIdMapAndSet(session, udId);
+//
+//        int screenPort = 0;
+//        int wait = 0;
+//        while (wait < 120) {
+//            Integer p = IOSWSServer.screenMap.get(udId);
+//            if (p != null) {
+//                screenPort = p;
+//                break;
+//            }
+//            Thread.sleep(500);
+//            wait++;
+//        }
+//        if (screenPort == 0) {
+//            return;
+//        }
+//        int finalScreenPort = screenPort;
+//        new Thread(() -> {
+//            URL url;
+//            try {
+//                url = new URL("http://localhost:" + finalScreenPort);
+//            } catch (MalformedURLException e) {
+//                return;
+//            }
+//            MjpegInputStream mjpegInputStream = null;
+//            int waitMjpeg = 0;
+//            while (mjpegInputStream == null) {
+//                try {
+//                    mjpegInputStream = new MjpegInputStream(url.openStream());
+//                } catch (IOException e) {
+//                    log.info(e.getMessage());
+//                }
+//                try {
+//                    Thread.sleep(1000);
+//                } catch (InterruptedException e) {
+//                    log.info(e.getMessage());
+//                    return;
+//                }
+//                waitMjpeg++;
+//                if (waitMjpeg >= 20) {
+//                    log.info("mjpeg server connect fail");
+//                    return;
+//                }
+//            }
+//            ByteBuffer bufferedImage;
+//            int i = 0;
+//            while (true) {
+//                try {
+//                    if ((bufferedImage = mjpegInputStream.readFrameForByteBuffer()) == null) break;
+//                } catch (IOException e) {
+//                    log.info(e.getMessage());
+//                    break;
+//                }
+//                i++;
+//                if (i % 3 != 0) {
+//                    sendByte(session, bufferedImage);
+//                } else {
+//                    i = 0;
+//                }
+//            }
+//            try {
+//                mjpegInputStream.close();
+//            } catch (IOException e) {
+//                throw new RuntimeException(e);
+//            }
+//            log.info("screen done.");
+//        }).start();
+//
+//        session.getUserProperties().put("schedule", ScheduleTool.schedule(() -> {
+//            log.info("time up!");
+//            if (session.isOpen()) {
+//                JSONObject errMsg = new JSONObject();
+//                errMsg.put("msg", "error");
+//                BytesTool.sendText(session, errMsg.toJSONString());
+//                exit(session);
+//            }
+//        }, BytesTool.remoteTimeout));
+//    }
     @OnOpen
     public void onOpen(Session session, @PathParam("key") String secretKey,
                        @PathParam("udId") String udId, @PathParam("token") String token) throws InterruptedException {
-        if (secretKey.length() == 0 || (!secretKey.equals(key)) || token.length() == 0) {
+        if (secretKey.isEmpty() || (!secretKey.equals(key)) || token.length() == 0) {
             log.info("Auth Failed!");
             return;
         }
@@ -85,54 +179,35 @@ public class IOSScreenWSServer implements IIOSWSServer {
         }
         int finalScreenPort = screenPort;
         new Thread(() -> {
-            URL url;
-            try {
-                url = new URL("http://localhost:" + finalScreenPort);
-            } catch (MalformedURLException e) {
-                return;
-            }
-            MjpegInputStream mjpegInputStream = null;
-            int waitMjpeg = 0;
-            while (mjpegInputStream == null) {
-                try {
-                    mjpegInputStream = new MjpegInputStream(url.openStream());
-                } catch (IOException e) {
-                    log.info(e.getMessage());
+            boolean active = true;
+            try (MjpegInputStream mjpeg = connectStream(finalScreenPort)) {
+                if (mjpeg == null) return;
+
+                int frameCounter = 0;
+                while (active && session.isOpen()) {
+                    try {
+                        ByteBuffer frame = mjpeg.readFrameForByteBuffer();//
+                        if (frame == null || frame.remaining() == 0) {
+                            log.warn("Attempt to send empty frame, session active: {}", session.isOpen());
+                            return;
+                        }
+
+                        // 改进的帧发送逻辑
+                        if (++frameCounter % 3 != 0) {
+                            if (!sendSafe(session, frame)) {
+                                active = false;
+                            }
+                        }
+                    } catch (IOException e) {
+                        log.error("Frame read error: {}", e.getMessage());
+                        active = false;
+                    }
                 }
-                try {
-                    Thread.sleep(1000);
-                } catch (InterruptedException e) {
-                    log.info(e.getMessage());
-                    return;
-                }
-                waitMjpeg++;
-                if (waitMjpeg >= 20) {
-                    log.info("mjpeg server connect fail");
-                    return;
-                }
-            }
-            ByteBuffer bufferedImage;
-            int i = 0;
-            while (true) {
-                try {
-                    if ((bufferedImage = mjpegInputStream.readFrameForByteBuffer()) == null) break;
-                } catch (IOException e) {
-                    log.info(e.getMessage());
-                    break;
-                }
-                i++;
-                if (i % 3 != 0) {
-                    sendByte(session, bufferedImage);
-                } else {
-                    i = 0;
-                }
-            }
-            try {
-                mjpegInputStream.close();
             } catch (IOException e) {
-                throw new RuntimeException(e);
+                log.error("MJPEG stream closed with error: {}", e.getMessage());
+            } finally {
+                closeResources(session);
             }
-            log.info("screen done.");
         }).start();
 
         session.getUserProperties().put("schedule", ScheduleTool.schedule(() -> {
@@ -144,6 +219,53 @@ public class IOSScreenWSServer implements IIOSWSServer {
                 exit(session);
             }
         }, BytesTool.remoteTimeout));
+    }
+
+    private MjpegInputStream connectStream(int port) {
+        int retries = 0;
+        while (retries < 20) {
+            try {
+                URL url = new URL("http://localhost:" + port);
+                return new MjpegInputStream(url.openStream());
+            } catch (Exception e) {
+                log.info("Connection attempt {}/20 failed: {}", ++retries, e.getMessage());
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    return null;
+                }
+            }
+        }
+        log.error("Failed to connect MJPEG server");
+        return null;
+    }
+
+    private boolean sendSafe(Session session, ByteBuffer buffer) {
+        if (buffer == null || buffer.remaining() == 0) {
+            log.warn("Attempt to send empty frame, session active: {}", session.isOpen());
+//            return;
+        }
+
+        try {
+            if (session.isOpen()) {
+                sendByte(session, buffer);
+                return true;
+            }
+        } catch (Exception e) {
+            log.error("Send failed: {}", e.getMessage());
+        }
+        return false;
+    }
+
+    private void closeResources(Session session) {
+        try {
+            if (session.isOpen()) {
+                session.close();
+            }
+        } catch (IOException e) {
+            log.error("Session close error: {}", e.getMessage());
+        }
     }
 
     @OnClose

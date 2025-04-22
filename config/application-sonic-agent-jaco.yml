@@ -1,8 +1,7 @@
 sonic:
   agent:
     # Replace with ipv4 of the agent machine | 替换为部署Agent机器的ipv4
-    host: 10.209.198.253 
-#    host: 10.209.192.207
+    host: 10.209.197.203
     # host: 10.209.1.246
     # Replace with the port of the agent service, which can be changed by yourself | 替换为Agent服务的端口，可以自行更改
     port: 7777
@@ -19,6 +18,3 @@ modules:
   ios:
     # Replace with the bundleId of wda. If there is no. xcrunner suffix, it will be automatically completed. | 替换为wda的bundleId，如果没有.xctrunner后缀会自动补全
     wda-bundle-id: com.jacotest.WebDriverAgentRunnerTester
-      # (mac only) Replace with the xcode project path of wda. | 替换为wda的xcode project目录
-    #wda-xcode-project-path: WebdriverAgent/WebDriverAgent.xcodeproj
-    wda-xcode-project-path: /Users/lyc/.appium/node_modules/appium-xcuitest-driver/node_modules/appium-webdriveragent

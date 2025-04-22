@@ -53,11 +53,11 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.Socket;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 import static org.cloud.sonic.agent.tools.BytesTool.sendText;
@@ -82,6 +82,9 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
     @Autowired
     private RestTemplate restTemplateBean;
     private static Map<String, Integer> webViewMap = new HashMap<>();
+
+    // 1. 增加进程状态同步锁（线程安全优化）
+    private static final Map<String, ReentrantLock> processLocks = new ConcurrentHashMap<>();
 
     @PostConstruct
     public void setEnv() {
@@ -165,7 +168,7 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
         String commandLine = "%s devices";
         List<String> data = ProcessCommandTool.getProcessLocalCommand(String.format(commandLine, sib));
         for (String a : data) {
-            if (a.length() == 0 || a.contains("no device")) {
+            if (a.isEmpty() || a.contains("no device")) {
                 break;
             }
             if (a.contains(" ")) {
@@ -226,103 +229,278 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
     }
 
     public static int[] startWda(String udId, int wdaPort, int mjpegPort) throws IOException, InterruptedException {
-        List<Process> processList;
-        if (IOSProcessMap.getMap().get(udId) != null) {
-            processList = IOSProcessMap.getMap().get(udId);
-            for (Process p : processList) {
-                if (p != null) {
-                    p.children().forEach(ProcessHandle::destroy);
-                    p.destroy();
+        ReentrantLock lock = processLocks.computeIfAbsent(udId, k -> new ReentrantLock());
+        lock.lock();
+        try {
+            // 添加初始化日志
+            logger.info("[{}] 开始启动WDA，目标端口 wdaPort={}, mjpegPort={}", udId, wdaPort, mjpegPort);
+
+
+            // 双重检查进程状态
+            if (IOSProcessMap.getMap().containsKey(udId) && isWdaAlive(udId)) {
+                logger.info("[{}] WDA already running, reuse existing process", udId);
+                return new int[]{wdaPort, mjpegPort};
+            }
+
+            List<Process> processList;
+            if (IOSProcessMap.getMap().get(udId) != null) {
+                processList = IOSProcessMap.getMap().get(udId);
+                for (Process p : processList) {
+                    if (p != null) {
+                        p.children().forEach(ProcessHandle::destroy);
+                        p.destroy();
+                    }
                 }
             }
-        }
-        wdaPort = (wdaPort == 0) ? PortTool.getPort() : wdaPort;
-        mjpegPort = (mjpegPort == 0) ? PortTool.getPort() : mjpegPort;
-        Process wdaProcess = null;
-        final Process[] iProxyProcess = {null};
-        String commandLine;
+            wdaPort = (wdaPort == 0) ? PortTool.getPort() : wdaPort;
+            mjpegPort = (mjpegPort == 0) ? PortTool.getPort() : mjpegPort;
+            Process wdaProcess = null;
+            final Process[] iProxyProcess = {null};
+            String commandLine;
 
-        // ios17 support, but mac only
-        if (isUpperThanIos17(udId)) {
-            commandLine = String.format(
-                    "xcodebuild -project %s -scheme WebDriverAgentRunner -destination 'id=%s' test",
-                    xcodeProjectPath, udId);
-        } else {
-            commandLine = String.format(
-                    "%s run wda -u %s -b %s --mjpeg-remote-port 9100 --server-remote-port 8100 --mjpeg-local-port %d --server-local-port %d",
-                    sib, udId, bundleId, mjpegPort, wdaPort);
-        }
-        String system = System.getProperty("os.name").toLowerCase();
-        if (system.contains("win")) {
-            wdaProcess = Runtime.getRuntime().exec(new String[]{"cmd", "/c", commandLine});
-        } else if (system.contains("linux") || system.contains("mac")) {
-            wdaProcess = Runtime.getRuntime().exec(new String[]{"sh", "-c", commandLine});
-        }
-        InputStreamReader inputStreamReader = new InputStreamReader(wdaProcess.getInputStream());
-        BufferedReader stdInput = new BufferedReader(inputStreamReader);
-        Semaphore isFinish = new Semaphore(0);
+            // ios17 support, but mac only
+            if (isUpperThanIos17(udId)) {
+                // 增强iOS17+设备的路径校验
+                File xcodeProj = new File(xcodeProjectPath);
+                logger.info("[{}] 正在验证Xcode项目路径：{}", udId, xcodeProj.getAbsolutePath());
 
-        int finalWdaPort = wdaPort;
-        int finalMjpegPort = mjpegPort;
+                // 增强路径格式兼容性
+                if (xcodeProj.isDirectory()) {
+                    xcodeProj = new File(xcodeProj, "WebDriverAgent.xcodeproj");
+                    logger.info("[{}] 自动补全项目文件路径：{}", udId, xcodeProj.getAbsolutePath());
+                }
 
-        Thread wdaThread = new Thread(() -> {
-            String s;
-            while (true) {
+                if (!xcodeProj.exists()) {
+                    logger.error("[{}] 无效的Xcode项目路径！请检查以下路径是否存在：{}", udId, xcodeProj.getAbsolutePath());
+                    return new int[]{0, 0};
+                }
+
+                commandLine = String.format(
+                        "xcodebuild -project \"%s\" -scheme WebDriverAgentRunner -destination 'id=%s' test",
+                        xcodeProj.getAbsolutePath(), // 使用带引号的路径防止空格问题
+                        udId);
+            } else {
+                commandLine = String.format(
+                        "%s run wda -u %s -b %s --mjpeg-remote-port 9100 --server-remote-port 8100 --mjpeg-local-port %d --server-local-port %d",
+                        sib, udId, bundleId, mjpegPort, wdaPort);
+            }
+            // 添加完整命令日志
+            logger.info("[{}] 执行WDA启动命令: {}", udId, commandLine);
+
+            String system = System.getProperty("os.name").toLowerCase();
+            if (system.contains("win")) {
+                wdaProcess = Runtime.getRuntime().exec(new String[]{"cmd", "/c", commandLine});
+            } else if (system.contains("linux") || system.contains("mac")) {
+                wdaProcess = Runtime.getRuntime().exec(new String[]{"sh", "-c", commandLine});
+                logger.debug("[{}] Unix-like环境进程已创建", udId);
+
+            }
+            // 在进程创建后增加错误流处理（关键补充）
+            InputStreamReader errorStreamReader = new InputStreamReader(wdaProcess.getErrorStream());
+            BufferedReader stdError = new BufferedReader(errorStreamReader);
+            Thread errorThread = new Thread(() -> {
+                String errLine;
                 try {
-                    if ((s = stdInput.readLine()) == null)
-                        break;
+                    while ((errLine = stdError.readLine()) != null) {
+                        logger.error("[{}] WDA错误输出: {}", udId, errLine);
+                    }
                 } catch (IOException e) {
-                    logger.info(e.getMessage());
-                    break;
+                    logger.error("[{}] 读取错误流异常: {}", udId, e.getMessage());
                 }
-                logger.info(s);
-                if (s.contains("ServerURLHere->")) {
-                    if (SibTool.isUpperThanIos17(udId)) {
-                        try {
-                            iProxyProcess[0] = Runtime.getRuntime().exec(
-                                    new String[]{"sh", "-c", String.format("iproxy -u %s %d:8100 %d:9100 -s 0.0.0.0",
-                                            udId, finalWdaPort, finalMjpegPort)});
-                        } catch (IOException e) {
-                            logger.info(e.getMessage());
-                        }
-                    }
+            });
+            errorThread.start();
+
+            InputStreamReader inputStreamReader = new InputStreamReader(wdaProcess.getInputStream());
+            BufferedReader stdInput = new BufferedReader(inputStreamReader);
+            Semaphore isFinish = new Semaphore(0);
+
+            int finalWdaPort = wdaPort;
+            int finalMjpegPort = mjpegPort;
+
+            Thread wdaThread = new Thread(() -> {
+                String s;
+                while (true) {
                     try {
-                        Thread.sleep(1000);
-                    } catch (InterruptedException e) {
-                        throw new RuntimeException(e);
+                        if ((s = stdInput.readLine()) == null)
+                            break;
+                    } catch (IOException e) {
+                        logger.error("[{}] 读取WDA输出流异常: {}", udId, e.getMessage());
+                        break;
                     }
-                    isFinish.release();
+                    logger.info("[WDA] {}", s);  // 添加WDA原始输出日志标签
+                    if (s.contains("ServerURLHere->")) {
+                        logger.info("[{}] 检测到WDA服务启动信号", udId);
+                        if (SibTool.isUpperThanIos17(udId)) {
+                            try {
+                                String iproxyCmd = String.format("iproxy -u %s %d:8100 %d:9100 -s 0.0.0.0",
+                                        udId, finalWdaPort, finalMjpegPort);
+                                logger.info("[{}] 启动iOS17+的iproxy: {}", udId, iproxyCmd);
+                                iProxyProcess[0] = Runtime.getRuntime().exec(
+                                        new String[]{"sh", "-c", String.format("iproxy -u %s %d:8100 %d:9100 -s 0.0.0.0",
+                                                udId, finalWdaPort, finalMjpegPort)});
+                            } catch (IOException e) {
+                                logger.error("[{}] 创建iproxy进程失败: {}", udId, e.getMessage());
+
+                            }
+                        }
+                        try {
+                            Thread.sleep(1000);
+                        } catch (InterruptedException e) {
+                            throw new RuntimeException(e);
+                        }
+                        isFinish.release();
+                    }
+                }
+                try {
+                    stdInput.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+                try {
+                    inputStreamReader.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+                logger.info("WebDriverAgent print thread shutdown.");
+            });
+            wdaThread.start();
+            int wait = 0;
+            while (!isFinish.tryAcquire()) {
+                Thread.sleep(500);
+                wait++;
+                if (wait >= 120) {
+                    logger.error("[{}] WDA启动超时！已等待{}秒", udId, wait/2);
+                    if (wdaProcess != null) {
+                        logger.error("[{}] WDA进程存活状态: {}", udId, wdaProcess.isAlive());
+                    }
+                    return new int[]{0, 0};
+
                 }
             }
-            try {
-                stdInput.close();
-            } catch (IOException e) {
-                e.printStackTrace();
+            logger.info("[{}] WDA启动成功，耗时{}秒", udId, wait/2);
+
+            processList = new ArrayList<>();
+            processList.add(wdaProcess);
+            if (iProxyProcess[0] != null) {
+                processList.add(iProxyProcess[0]);
             }
+            IOSProcessMap.getMap().put(udId, processList);
+
+
+            // 新增：启动守护线程监控WDA进程
+            List<Process> finalProcessList = processList;
+            // 修改原有的守护线程逻辑
+            IOSDeviceThreadPool.cachedThreadPool.execute(() -> {
+                logger.info("[{}] 启动WDA守护监控线程", udId);
+
+                while (!Thread.currentThread().isInterrupted()) {
+                    try {
+                        // 检查主进程状态
+                        boolean needRestart = finalProcessList.stream()
+                                .anyMatch(p -> !p.isAlive());
+                        logger.debug("[{}] 进程存活检查结果: needRestart={}", udId, needRestart);
+
+
+                        // 进程被主动停止时会移除映射，监控线程自动退出
+                        if (needRestart) {
+                            // 添加同步锁防止并发操作
+                            logger.warn("[{}] 检测到WDA进程异常退出，存活状态: {}",
+                                    udId, finalProcessList.stream().map(p -> p.isAlive()).collect(Collectors.toList()));
+                            synchronized (IOSProcessMap.getMap()) {
+                                // 再次验证映射关系
+                                if (IOSProcessMap.getMap().containsKey(udId)) {
+                                    logger.warn("[{}] WDA进程异常退出，尝试重启...", udId);
+                                    try {
+                                        // 先清理旧进程再启动
+                                        stopWda(udId);
+                                        startWda(udId, finalWdaPort, finalMjpegPort);
+                                    } catch (Exception e) {
+                                        logger.error("[{}] WDA重启失败: {}", udId, e.getMessage());
+                                    }
+                                }
+                            }
+                            break;
+                        }
+
+                        // 每5秒检查一次
+                        Thread.sleep(5000);
+                    }catch (InterruptedException e) { // 捕获中断异常
+                        logger.info("[{}] WDA监控线程被中断", udId);
+                        break;
+                    } catch (Exception e) {
+                        logger.error("[{}] WDA监控线程异常: {}", udId, e.getMessage());
+                        logger.error("[{}] 守护线程发生未预期异常: {}", udId, e.getMessage());
+
+                        break;
+                    }
+                }
+            });
+
+            return new int[]{wdaPort, mjpegPort};
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // 3. 增加进程存活检查方法（稳定性优化）
+    private static boolean isWdaAlive(String udId) {
+        return IOSProcessMap.getMap().getOrDefault(udId, Collections.emptyList())
+                .stream().anyMatch(Process::isAlive);
+    }
+
+    // 4. 优化资源回收（内存泄漏修复）
+    public static void stopWda(String udId) {
+        ReentrantLock lock = processLocks.get(udId);
+        if (lock != null) {
+            lock.lock();
             try {
-                inputStreamReader.close();
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-            logger.info("WebDriverAgent print thread shutdown.");
-        });
-        wdaThread.start();
-        int wait = 0;
-        while (!isFinish.tryAcquire()) {
-            Thread.sleep(500);
-            wait++;
-            if (wait >= 120) {
-                logger.info(udId + " WebDriverAgent start timeout!");
-                return new int[]{0, 0};
+                if (IOSProcessMap.getMap().containsKey(udId)) {
+                    // 增加流关闭操作（关键资源释放）
+                    IOSProcessMap.getMap().get(udId).forEach(p -> {
+                        closeProcessResources(p); // 新增资源关闭方法
+                        if (p.isAlive()) {
+                            p.destroyForcibly();
+                            // 新增终止确认逻辑
+                            try {
+                                if (p.waitFor(3, TimeUnit.SECONDS)) {
+                                    logger.info("[{}] 进程正常退出", udId);
+                                } else {
+                                    logger.warn("[{}] 进程强制终止超时", udId);
+                                }
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                            }
+                        }
+                    });
+                    IOSProcessMap.getMap().remove(udId);
+                    logger.info("[{}] WDA进程已停止", udId);
+                }
+            } finally {
+                lock.unlock();
+                processLocks.remove(udId); // 清理锁资源
             }
         }
-        processList = new ArrayList<>();
-        processList.add(wdaProcess);
-        if (iProxyProcess[0] != null) {
-            processList.add(iProxyProcess[0]);
+    }
+    // 5. 新增公共方法关闭进程资源（减少代码重复）
+    private static void closeProcessResources(Process p) {
+        int maxRetries = 3;
+        for (int i = 0; i < maxRetries; i++) {
+            try {
+                if (p.getInputStream() != null) p.getInputStream().close();
+                if (p.getErrorStream() != null) p.getErrorStream().close();
+                if (p.getOutputStream() != null) p.getOutputStream().close();
+                return;
+            } catch (IOException e) {
+                if (i == maxRetries - 1) {
+                    logger.warn("关闭进程资源失败: {}", e.getMessage());
+                }
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                }
+            }
         }
-        IOSProcessMap.getMap().put(udId, processList);
-        return new int[]{wdaPort, mjpegPort};
     }
 
     public static void reboot(String udId) {
@@ -437,24 +615,44 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
                 try {
                     if ((s = stdInput.readLine()) == null)
                         break;
-                } catch (IOException e) {
-                    logger.info(e.getMessage());
+                    // 增加会话状态检查
+                    if (!session.isOpen()) {
+                        logger.warn("[{}] Session已关闭，终止方向监听", udId);
+                        break;
+                    }
+
+                    logger.info(s);
+                    if (s.contains("orientation") && (!s.contains("0")) && (!s.contains("failed"))) {
+                        int result = switch (BytesTool.getInt(s)) {
+                            case 2 -> 180;
+                            case 3 -> 270;
+                            case 4 -> 90;
+                            default -> 0;
+                        };
+                        JSONObject rotation = new JSONObject();
+                        rotation.put("msg", "rotation");
+                        rotation.put("value", result);
+                        try {
+                            sendText(session, rotation.toJSONString());
+                        } catch (IllegalStateException e) {
+                            logger.error("[{}] 发送旋转数据失败: {}", udId, e.getMessage());
+                            break;
+                        }
+                    }
+                } catch (Exception e) { // 扩大异常捕获范围
+                    logger.error("[{}] 方向监听异常: {}", udId, e.getMessage());
                     break;
                 }
-                logger.info(s);
-                if (s.contains("orientation") && (!s.contains("0")) && (!s.contains("failed"))) {
-                    int result = switch (BytesTool.getInt(s)) {
-                        case 2 -> 180;
-                        case 3 -> 270;
-                        case 4 -> 90;
-                        default -> 0;
-                    };
-                    JSONObject rotation = new JSONObject();
-                    rotation.put("msg", "rotation");
-                    rotation.put("value", result);
-                    sendText(session, rotation.toJSONString());
-                }
             }
+            // 增加资源清理
+            try {
+                if (session != null && session.isOpen()) {
+                    session.close();
+                }
+            } catch (IOException e) {
+                logger.error("[{}] 关闭会话异常: {}", udId, e.getMessage());
+            }
+
             try {
                 stdInput.close();
             } catch (IOException e) {
@@ -876,7 +1074,7 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
         Process ps = null;
         String commandLine = "%s perfmon -r %d --sys-cpu --sys-mem --sys-disk --sys-network --fps --gpu -u %s%s ";
         String system = System.getProperty("os.name").toLowerCase();
-        String tail = bundleId.length() == 0 ? "" : (" --proc-cpu --proc-mem -b " + bundleId);
+        String tail = bundleId.isEmpty() ? "" : (" --proc-cpu --proc-mem -b " + bundleId);
         try {
             if (system.contains("win")) {
                 ps = Runtime.getRuntime()
