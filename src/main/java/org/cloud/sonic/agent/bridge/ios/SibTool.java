@@ -73,8 +73,13 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
     @Value("${modules.ios.wda-xcode-project-path:default}")
     private String getXcodeProjectPath;
 
+    @Value("${modules.ios.use-go-ios-tunnel:false}")
+    private Boolean getUseGoIosTunnel;
+
     private static String bundleId;
     private static String xcodeProjectPath;
+    private static Boolean useGoIosTunnel;
+    private static String sudoPassword;
     private static File sibBinary = new File("plugins" + File.separator + "sonic-ios-bridge");
     private static String sib = sibBinary.getAbsolutePath();
     private static RestTemplate restTemplate;
@@ -90,6 +95,21 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
     public void setEnv() {
         bundleId = getBundleId;
         xcodeProjectPath = getXcodeProjectPath;
+        useGoIosTunnel = getUseGoIosTunnel;
+
+        sudoPassword = System.getenv("SUDO_PASSWORD");
+        if (sudoPassword == null || sudoPassword.isEmpty()) {
+            sudoPassword = System.getProperty("sudo.password", "");
+        }
+
+        if (useGoIosTunnel != null && useGoIosTunnel) {
+            if (sudoPassword.isEmpty()) {
+                logger.warn("go-iOS隧道方案已启用但未设置sudo密码（SUDO_PASSWORD环境变量或sudo.password系统属性），将回退到xcodebuild方案");
+                useGoIosTunnel = false;
+            } else {
+                logger.info("go-iOS隧道方案已启用，sudo密码已配置");
+            }
+        }
     }
 
     @Override
@@ -100,6 +120,11 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
 
     public void init() {
         restTemplate = restTemplateBean;
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            logger.info("JVM关闭钩子触发，清理所有iOS进程...");
+            cleanupAllProcesses();
+        }));
         IOSDeviceThreadPool.cachedThreadPool.execute(() -> {
             String processName = "sib";
             if (GlobalProcessMap.getMap().get(processName) != null) {
@@ -228,15 +253,218 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
         return startWda(udId, wdaPort, mjpegPort);
     }
 
+    private static int[] startWdaWithGoIos(String udId, int wdaPort, int mjpegPort, boolean skipTunnel) throws IOException, InterruptedException {
+        logger.info("[{}] 使用go-iOS隧道方案启动WDA{}", udId, skipTunnel ? " (跳过tunnel启动)" : "");
+        List<Process> processList = new ArrayList<>();
+        String sudoPassword = SibTool.sudoPassword;
+        if (sudoPassword == null || sudoPassword.isEmpty()) {
+            logger.error("[{}] 无法获取sudo密码，请设置环境变量SUDO_PASSWORD或JVM参数-Dsudo.password", udId);
+            throw new IOException("无法获取sudo密码");
+        }
+        if (skipTunnel) {
+            if (!isGoIosTunnelActive(udId)) {
+                logger.warn("[{}] Tunnel未激活，无法跳过启动", udId);
+                throw new IOException("Tunnel未激活");
+            }
+            logger.info("[{}] 使用现有go-iOS隧道", udId);
+        } else {
+            // 步骤1: 启动隧道
+            logger.info("[{}] 步骤1: 启动go-iOS隧道...", udId);
+
+            // 先停止可能残留的隧道进程（避免端口占用错误）
+            try {
+                Process stopProcess = Runtime.getRuntime().exec("ios tunnel stop 2>/dev/null");
+                stopProcess.waitFor(2, TimeUnit.SECONDS);
+                logger.debug("[{}] 清理残留隧道完成", udId);
+            } catch (Exception e) {
+                logger.debug("[{}] 清理残留隧道失败（可能没有残留）: {}", udId, e.getMessage());
+            }
+
+            String tunnelCmd = String.format("echo '%s' | sudo -S ios tunnel start --udid=%s 2>&1", sudoPassword, udId);
+            Process tunnelProcess = Runtime.getRuntime().exec(new String[]{"sh", "-c", tunnelCmd});
+            processList.add(tunnelProcess);
+
+            Thread tunnelLogThread = new Thread(() -> {
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(tunnelProcess.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        logger.info("[{}] Tunnel输出: {}", udId, line);
+                    }
+                } catch (IOException e) {
+                    logger.error("[{}] Tunnel日志读取失败: {}", udId, e.getMessage());
+                }
+            });
+            tunnelLogThread.start();
+
+            Thread.sleep(5000);
+
+            if (!tunnelProcess.isAlive() && tunnelProcess.exitValue() != 0) {
+                logger.error("[{}] go-iOS隧道启动失败，退出码: {}", udId, tunnelProcess.exitValue());
+                return new int[]{0, 0};
+            }
+
+            logger.info("[{}] go-iOS隧道启动成功", udId);
+        }
+
+        // 步骤2: 启动WDA
+        String runwdaCmd = String.format(
+            "ios runwda --bundleid=com.weoqa.WebDriverAgentRunnerTester --testrunnerbundleid=com.weoqa.WebDriverAgentRunnerTester --xctestconfig=WebDriverAgentRunner.xctest --udid=%s",
+            udId
+        );
+
+        logger.info("[{}] 步骤2: 执行go-iOS命令: {}", udId, runwdaCmd);
+
+        Process wdaProcess = Runtime.getRuntime().exec(new String[]{"sh", "-c", runwdaCmd});
+        processList.add(wdaProcess);
+
+        Semaphore isFinish = new Semaphore(0);
+
+        InputStreamReader errorStreamReader = new InputStreamReader(wdaProcess.getErrorStream());
+        BufferedReader stdError = new BufferedReader(errorStreamReader);
+        Thread errorThread = new Thread(() -> {
+            String errLine;
+            try {
+                while ((errLine = stdError.readLine()) != null) {
+                    logger.error("[{}] WDA错误输出: {}", udId, errLine);
+                    if (errLine.contains("ServerURLHere") || errLine.contains("Started session successfully") || errLine.contains("\"authorized\":true")) {
+                        logger.info("[{}] 从错误流检测到WDA服务启动信号", udId);
+                        isFinish.release();
+                    }
+                }
+            } catch (IOException e) {
+                logger.error("[{}] 读取错误流异常: {}", udId, e.getMessage());
+            }
+        });
+        errorThread.start();
+
+        InputStreamReader inputStreamReader = new InputStreamReader(wdaProcess.getInputStream());
+        BufferedReader stdInput = new BufferedReader(inputStreamReader);
+
+        Thread wdaThread = new Thread(() -> {
+            String s;
+            while (true) {
+                try {
+                    if ((s = stdInput.readLine()) == null)
+                        break;
+                } catch (IOException e) {
+                    logger.error("[{}] 读取WDA输出流异常: {}", udId, e.getMessage());
+                    break;
+                }
+                logger.info("[WDA] {}", s);
+                if (s.contains("ServerURLHere") || s.contains("Started session successfully") || s.contains("\"authorized\":true")) {
+                    logger.info("[{}] 检测到WDA服务启动信号", udId);
+                    try {
+                        Thread.sleep(1000);
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                    isFinish.release();
+                    break;
+                }
+            }
+            try {
+                stdInput.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+            try {
+                inputStreamReader.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+            logger.info("WebDriverAgent print thread shutdown.");
+        });
+        wdaThread.start();
+
+        int wait = 0;
+        while (!isFinish.tryAcquire()) {
+            Thread.sleep(500);
+            wait++;
+            if (wait >= 120) {
+                logger.error("[{}] WDA启动超时！已等待{}秒", udId, wait / 2);
+                if (wdaProcess != null) {
+                    logger.error("[{}] WDA进程存活状态: {}", udId, wdaProcess.isAlive());
+                }
+                return new int[]{0, 0};
+            }
+        }
+        logger.info("[{}] WDA启动成功，耗时{}秒", udId, wait / 2);
+
+        Thread.sleep(5000);
+
+        logger.info("[{}] 启动端口转发...", udId);
+
+        Process forwardWdaProcess = startForwardWithRetry(udId, wdaPort, 8100, "WDA");
+        if (forwardWdaProcess == null) {
+            logger.error("[{}] WDA端口转发启动失败", udId);
+            stopWda(udId);
+            return new int[]{0, 0};
+        }
+        processList.add(forwardWdaProcess);
+
+        Process forwardMjpegProcess = startForwardWithRetry(udId, mjpegPort, 9100, "MJPEG");
+        if (forwardMjpegProcess == null) {
+            logger.error("[{}] MJPEG端口转发启动失败", udId);
+            stopWda(udId);
+            return new int[]{0, 0};
+        }
+        processList.add(forwardMjpegProcess);
+
+        Thread.sleep(2000);
+
+        logger.info("[{}] 端口转发进程状态: WDAForward={}, MJPEGForward={}",
+            udId, forwardWdaProcess.isAlive(), forwardMjpegProcess.isAlive());
+
+        IOSProcessMap.getMap().put(udId, processList);
+
+        List<Process> finalProcessList = processList;
+        IOSDeviceThreadPool.cachedThreadPool.execute(() -> {
+            logger.info("[{}] 启动WDA守护监控线程", udId);
+
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    // go-iOS 方案: tunnel 会正常退出，只监控核心进程（WDA + 2个forward）
+                    boolean needRestart = finalProcessList.stream().skip(1).anyMatch(p -> !p.isAlive());
+                    logger.debug("[{}] 进程存活检查结果: needRestart={}", udId, needRestart);
+
+                    if (needRestart) {
+                        logger.warn("[{}] 检测到进程异常退出，存活状态: {}",
+                            udId, finalProcessList.stream().map(Process::isAlive).collect(Collectors.toList()));
+                        synchronized (IOSProcessMap.getMap()) {
+                            if (IOSProcessMap.getMap().containsKey(udId)) {
+                                logger.warn("[{}] WDA进程异常退出，尝试重启...", udId);
+                                try {
+                                    stopWda(udId);
+                                    // go-iOS模式: 直接调用 startWdaWithGoIos 并跳过 tunnel 启动
+                                    startWdaWithGoIos(udId, wdaPort, mjpegPort, true);
+                                } catch (Exception e) {
+                                    logger.error("[{}] WDA重启失败: {}", udId, e.getMessage());
+                                }
+                            }
+                        }
+                        break;
+                    }
+
+                    Thread.sleep(5000);
+                } catch (InterruptedException e) {
+                    logger.info("[{}] WDA监控线程被中断", udId);
+                    break;
+                } catch (Exception e) {
+                    logger.error("[{}] WDA监控线程异常: {}", udId, e.getMessage());
+                    break;
+                }
+            }
+        });
+
+        return new int[]{wdaPort, mjpegPort};
+    }
+
     public static int[] startWda(String udId, int wdaPort, int mjpegPort) throws IOException, InterruptedException {
         ReentrantLock lock = processLocks.computeIfAbsent(udId, k -> new ReentrantLock());
         lock.lock();
         try {
-            // 添加初始化日志
             logger.info("[{}] 开始启动WDA，目标端口 wdaPort={}, mjpegPort={}", udId, wdaPort, mjpegPort);
 
-
-            // 双重检查进程状态
             if (IOSProcessMap.getMap().containsKey(udId) && isWdaAlive(udId)) {
                 logger.info("[{}] WDA already running, reuse existing process", udId);
                 return new int[]{wdaPort, mjpegPort};
@@ -260,6 +488,10 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
 
             // ios17 support, but mac only
             if (isUpperThanIos17(udId)) {
+                if (useGoIosTunnel != null && useGoIosTunnel) {
+                    return startWdaWithGoIos(udId, wdaPort, mjpegPort, false);
+                }
+
                 // 增强iOS17+设备的路径校验
                 File xcodeProj = new File(xcodeProjectPath);
                 logger.info("[{}] 正在验证Xcode项目路径：{}", udId, xcodeProj.getAbsolutePath());
@@ -276,9 +508,9 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
                 }
 
                 commandLine = String.format(
-                        "xcodebuild -project \"%s\" -scheme WebDriverAgentRunner -destination 'id=%s' test",
-                        xcodeProj.getAbsolutePath(), // 使用带引号的路径防止空格问题
-                        udId);
+                    "xcodebuild -project \"%s\" -scheme WebDriverAgentRunner -destination 'id=%s' test",
+                    xcodeProj.getAbsolutePath(), // 使用带引号的路径防止空格问题
+                    udId);
             } else {
                 commandLine = String.format(
                         "%s run wda -u %s -b %s --mjpeg-remote-port 9100 --server-remote-port 8100 --mjpeg-local-port %d --server-local-port %d",
@@ -442,10 +674,63 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
         }
     }
 
-    // 3. 增加进程存活检查方法（稳定性优化）
-    private static boolean isWdaAlive(String udId) {
+private static boolean isWdaAlive(String udId) {
         return IOSProcessMap.getMap().getOrDefault(udId, Collections.emptyList())
-                .stream().anyMatch(Process::isAlive);
+            .stream().anyMatch(Process::isAlive);
+    }
+
+    private static Process startForwardWithRetry(String udId, int localPort, int devicePort, String name) {
+        int maxRetries = 5;
+        for (int i = 0; i < maxRetries; i++) {
+            try {
+                logger.info("[{}] 启动{}端口转发 (尝试 {}/{}): {} -> {}", udId, name, i + 1, maxRetries, localPort, devicePort);
+                String forwardCmd = String.format("ios forward --udid=%s %d %d 2>&1", udId, localPort, devicePort);
+                Process forwardProcess = Runtime.getRuntime().exec(new String[]{"sh", "-c", forwardCmd});
+
+                Thread logThread = new Thread(() -> {
+                    try (BufferedReader reader = new BufferedReader(new InputStreamReader(forwardProcess.getInputStream()))) {
+                        String line;
+                        while ((line = reader.readLine()) != null) {
+                            logger.info("[{}] Forward{}输出: {}", udId, name, line);
+                        }
+                    } catch (IOException e) {
+                        logger.error("[{}] Forward{}日志读取失败: {}", udId, name, e.getMessage());
+                    }
+                });
+                logThread.start();
+
+                Thread.sleep(2000);
+
+                if (forwardProcess.isAlive()) {
+                    logger.info("[{}] {}端口转发启动成功", udId, name);
+                    return forwardProcess;
+                } else {
+                    logger.warn("[{}] {}端口转发进程已退出，等待重试...", udId, name);
+                    Thread.sleep(3000);
+                }
+            } catch (Exception e) {
+                logger.error("[{}] 启动{}端口转发失败: {}", udId, name, e.getMessage());
+            }
+        }
+        return null;
+    }
+
+    private static boolean isGoIosTunnelActive(String udId) {
+        try {
+            Process checkProcess = Runtime.getRuntime().exec(new String[]{"sh", "-c", "ios tunnel ls"});
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(checkProcess.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (line.contains(udId)) {
+                        return true;
+                    }
+                }
+            }
+            checkProcess.waitFor(2, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            logger.error("[{}] 检查go-iOS隧道状态失败: {}", udId, e.getMessage());
+        }
+        return false;
     }
 
     // 4. 优化资源回收（内存泄漏修复）
@@ -482,6 +767,31 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
         }
     }
     // 5. 新增公共方法关闭进程资源（减少代码重复）
+    private static void cleanupAllProcesses() {
+        logger.info("开始清理所有iOS相关进程...");
+
+        IOSProcessMap.getMap().keySet().forEach(udId -> {
+            try {
+                stopWda(udId);
+                logger.info("[{}] WDA进程已清理", udId);
+            } catch (Exception e) {
+                logger.error("[{}] 清理WDA进程失败: {}", udId, e.getMessage());
+            }
+        });
+
+        if (useGoIosTunnel != null && useGoIosTunnel) {
+            try {
+                Process cleanupProcess = Runtime.getRuntime().exec(new String[]{"sh", "-c", "pkill -f 'ios tunnel start'"});
+                cleanupProcess.waitFor(2, TimeUnit.SECONDS);
+                logger.info("go-iOS隧道进程已清理");
+            } catch (Exception e) {
+                logger.warn("清理go-iOS隧道进程失败: {}", e.getMessage());
+            }
+        }
+
+        logger.info("所有iOS进程清理完成");
+    }
+
     private static void closeProcessResources(Process p) {
         int maxRetries = 3;
         for (int i = 0; i < maxRetries; i++) {

@@ -175,6 +175,7 @@ public class IOSScreenWSServer implements IIOSWSServer {
             wait++;
         }
         if (screenPort == 0) {
+            log.warn("异常：Screen port {} not found for udId: {}, aborting connection", screenPort, udId);
             return;
         }
         int finalScreenPort = screenPort;
@@ -183,28 +184,39 @@ public class IOSScreenWSServer implements IIOSWSServer {
             try (MjpegInputStream mjpeg = connectStream(finalScreenPort)) {
                 if (mjpeg == null) return;
 
-                int frameCounter = 0;
+                // Skip incomplete frames at startup (WDA MJPEG needs time to warm up)
+                int consecutiveEmptyFrames = 0;
+                final int MAX_EMPTY_FRAMES = 10;
+
                 while (active && session.isOpen()) {
                     try {
-                        ByteBuffer frame = mjpeg.readFrameForByteBuffer();//
-                        if (frame == null || frame.remaining() == 0) {
-                            log.warn("Attempt to send empty frame, session active: {}", session.isOpen());
-                            return;
-                        }
-
-                        // 改进的帧发送逻辑
-                        if (++frameCounter % 3 != 0) {
+                        ByteBuffer frame = mjpeg.readFrameForByteBuffer();
+                        if (frame != null && frame.hasRemaining()) {
+                            consecutiveEmptyFrames = 0;
                             if (!sendSafe(session, frame)) {
+                                active = false;
+                            }
+                        } else {
+                            consecutiveEmptyFrames++;
+                            if (consecutiveEmptyFrames < MAX_EMPTY_FRAMES) {
+                                log.debug("[Screen] Skipping empty/incomplete frame {}/{}", consecutiveEmptyFrames, MAX_EMPTY_FRAMES);
+                            } else {
+                                log.warn("[Screen] Too many consecutive empty frames ({}), stopping stream", MAX_EMPTY_FRAMES);
                                 active = false;
                             }
                         }
                     } catch (IOException e) {
-                        log.error("Frame read error: {}", e.getMessage());
-                        active = false;
+                        consecutiveEmptyFrames++;
+                        if (consecutiveEmptyFrames < MAX_EMPTY_FRAMES) {
+                            log.debug("[Screen] Frame parse error ({}/{}): {}", consecutiveEmptyFrames, MAX_EMPTY_FRAMES, e.getMessage());
+                        } else {
+                            log.error("[Screen] Too many frame errors, stopping stream", e);
+                            active = false;
+                        }
                     }
                 }
-            } catch (IOException e) {
-                log.error("MJPEG stream closed with error: {}", e.getMessage());
+            } catch (Exception e) {
+                log.error("[Screen] MJPEG stream closed with error: {}", e.getMessage());
             } finally {
                 closeResources(session);
             }
