@@ -100,17 +100,46 @@ public class MjpegInputStream extends DataInputStream {
         mark(FRAME_MAX_LENGTH);
         int n = getStartOfSequence(this, SOI_MARKER);
         reset();
+        
+        // 调试：检查 n 的值
+        if (n < 0) {
+            log.error("Failed to find SOI_MARKER (0xFF 0xD8) in stream!");
+            return null;
+        }
+        
         final byte[] header = new byte[n];
         readFully(header);
-        int length;
+        
+        // 调试：打印 header 内容
+        String headerStr = new String(header, java.nio.charset.StandardCharsets.UTF_8);
+        log.debug("MJPEG Header ({} bytes): {}", n, headerStr.length() > 500 ? headerStr.substring(0, 500) + "..." : headerStr);
+        
+        int length = 0;
         try {
             length = parseContentLength(header);
+            log.debug("Parsed Content-Length: {}", length);
         } catch (NumberFormatException e) {
-            length = getEndOfSequence(this, EOI_MARKER);
+            log.warn("Failed to parse Content-Length, searching for EOI marker");
         }
+        
+        // 如果没有 Content-Length，尝试找 EOI_MARKER 来确定帧边界
         if (length == 0) {
-            log.error("EOI Marker 0xFF,0xD9 not found!");
+            reset();  // 重置流位置，因为前面读取 header 时流已移动
+            skipBytes(n);  // 跳过 header 部分
+            length = getEndOfSequence(this, EOI_MARKER);
+            if (length > 0) {
+                // EOI_MARKER 的位置减去当前位置就是帧数据长度
+                // 由于 getEndOfSequence 返回的是从当前位置到 EOI 的字节数
+                // 需要加上 SOI_MARKER 的长度
+                length += 2;  // EOI_MARKER 长度
+            }
         }
+        
+        if (length <= 0) {
+            log.error("Failed to find frame boundary (no Content-Length and no EOI Marker)! Header: {}", headerStr.length() > 200 ? headerStr.substring(0, 200) : headerStr);
+            return null;
+        }
+        
         reset();
 
         // 优化点：使用线程局部变量缓存缓冲区

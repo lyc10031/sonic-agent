@@ -186,7 +186,7 @@ public class IOSScreenWSServer implements IIOSWSServer {
 
                 // Skip incomplete frames at startup (WDA MJPEG needs time to warm up)
                 int consecutiveEmptyFrames = 0;
-                final int MAX_EMPTY_FRAMES = 10;
+                final int MAX_EMPTY_FRAMES = 100;
 
                 while (active && session.isOpen()) {
                     try {

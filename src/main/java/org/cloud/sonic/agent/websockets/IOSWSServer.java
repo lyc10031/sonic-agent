@@ -133,6 +133,7 @@ public class IOSWSServer implements IIOSWSServer {
             SibTool.orientationWatcher(udId, session);
         }
 
+        log.info("udid: {}, wda forward port: {}, screen forward port: {}", udId, ports[0], ports[1]);
         IOSDeviceThreadPool.cachedThreadPool.execute(() -> {
             IOSStepHandler iosStepHandler = new IOSStepHandler();
             iosStepHandler.setTestMode(0, 0, udId, DeviceStatus.DEBUGGING, session.getUserProperties().get("id").toString());

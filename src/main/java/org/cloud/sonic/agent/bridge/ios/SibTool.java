@@ -308,8 +308,8 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
 
         // 步骤2: 启动WDA
         String runwdaCmd = String.format(
-            "ios runwda --bundleid=com.weoqa.WebDriverAgentRunnerTester --testrunnerbundleid=com.weoqa.WebDriverAgentRunnerTester --xctestconfig=WebDriverAgentRunner.xctest --udid=%s",
-            udId
+            "ios runwda --bundleid=%s --testrunnerbundleid=%s --xctestconfig=WebDriverAgentRunner.xctest --udid=%s",
+            bundleId, bundleId, udId
         );
 
         logger.info("[{}] 步骤2: 执行go-iOS命令: {}", udId, runwdaCmd);
@@ -1476,6 +1476,9 @@ private static boolean isWdaAlive(String udId) {
     }
 
     public static void startShare(String udId, Session session) {
+        // if (useGoIosTunnel) {
+        //     return;
+        // }
         String processName = String.format("process-%s-sib-share", udId);
         String commandLine = "%s remote share -u %s -p %d";
         stopShare(udId);
