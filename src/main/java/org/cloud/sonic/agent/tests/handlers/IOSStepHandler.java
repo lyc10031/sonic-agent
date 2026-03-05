@@ -206,6 +206,14 @@ public class IOSStepHandler {
         return udId;
     }
 
+    public String getIpAddress() {
+        return SibTool.getIpAddress(udId);
+    }
+
+    public String getAppVersion(String bundleId) {
+        return SibTool.getAppVersion(udId, bundleId);
+    }
+
     private boolean isLockStatus = false;
 
     public void setResultDetailStatus(int status) {

@@ -91,6 +91,10 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
     // 1. 增加进程状态同步锁（线程安全优化）
     private static final Map<String, ReentrantLock> processLocks = new ConcurrentHashMap<>();
 
+    // 预编译正则，提高解析性能 (ROI: 性能优化)
+    private static final java.util.regex.Pattern SERVER_URL_PATTERN =
+            java.util.regex.Pattern.compile("ServerURLHere->(http://([^:/]+):(\\d+))");
+
     @PostConstruct
     public void setEnv() {
         bundleId = getBundleId;
@@ -326,6 +330,7 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
             try {
                 while ((errLine = stdError.readLine()) != null) {
                     logger.error("[{}] WDA错误输出: {}", udId, errLine);
+                    extractIpFromLog(udId, errLine);
                     if (errLine.contains("ServerURLHere") || errLine.contains("Started session successfully") || errLine.contains("\"authorized\":true")) {
                         logger.info("[{}] 从错误流检测到WDA服务启动信号", udId);
                         isFinish.release();
@@ -351,6 +356,7 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
                     break;
                 }
                 logger.info("[WDA] {}", s);
+                extractIpFromLog(udId, s);
                 if (s.contains("ServerURLHere") || s.contains("Started session successfully") || s.contains("\"authorized\":true")) {
                     logger.info("[{}] 检测到WDA服务启动信号", udId);
                     try {
@@ -359,7 +365,7 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
                         throw new RuntimeException(e);
                     }
                     isFinish.release();
-                    break;
+                    // 优化：不在这里 break，继续监听后续可能的 ServerURLHere 信号以提取 IP
                 }
             }
             try {
@@ -389,6 +395,9 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
             }
         }
         logger.info("[{}] WDA启动成功，耗时{}秒", udId, wait / 2);
+
+        // ROI 最佳方案：主动探测 IP
+        updateIpViaWdaStatus(udId, wdaPort);
 
         Thread.sleep(5000);
 
@@ -467,6 +476,8 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
 
             if (IOSProcessMap.getMap().containsKey(udId) && isWdaAlive(udId)) {
                 logger.info("[{}] WDA already running, reuse existing process", udId);
+                // 即使是复用，也尝试探测一次 IP (解决已连接设备 IP 为 null 的问题)
+                updateIpViaWdaStatus(udId, wdaPort);
                 return new int[]{wdaPort, mjpegPort};
             }
 
@@ -535,6 +546,7 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
                 try {
                     while ((errLine = stdError.readLine()) != null) {
                         logger.error("[{}] WDA错误输出: {}", udId, errLine);
+                        extractIpFromLog(udId, errLine);
                     }
                 } catch (IOException e) {
                     logger.error("[{}] 读取错误流异常: {}", udId, e.getMessage());
@@ -560,6 +572,7 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
                         break;
                     }
                     logger.info("[WDA] {}", s);  // 添加WDA原始输出日志标签
+                    extractIpFromLog(udId, s);
                     if (s.contains("ServerURLHere->")) {
                         logger.info("[{}] 检测到WDA服务启动信号", udId);
                         if (SibTool.isUpperThanIos17(udId)) {
@@ -609,7 +622,10 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
 
                 }
             }
-            logger.info("[{}] WDA启动成功，耗时{}秒", udId, wait/2);
+            logger.info("[{}] WDA启动成功，耗时{}秒", udId, wait / 2);
+
+            // ROI 最佳方案：主动探测 IP
+            updateIpViaWdaStatus(udId, wdaPort);
 
             processList = new ArrayList<>();
             processList.add(wdaProcess);
@@ -1034,6 +1050,37 @@ private static boolean isWdaAlive(String udId) {
         }
         logger.info("app list done.");
         return result;
+    }
+
+    /**
+     * 获取指定 App 的版本信息
+     * 优先获取市场版本号 (如 3.33.0)，其次获取构建版本号 (如 19)
+     *
+     * @param udId     设备UDID
+     * @param bundleId 应用包名
+     * @return 版本号字符串
+     */
+    public static String getAppVersion(String udId, String bundleId) {
+        List<JSONObject> apps = getAppList(udId, null);
+        for (JSONObject app : apps) {
+            if (bundleId.equals(app.getString("bundleId"))) {
+                // 1. 优先取市场版本号 (Short Version String)，这通常是 3.33.0 这种格式
+                String shortVersion = app.getString("shortVersion");
+                if (StringUtils.hasText(shortVersion)) {
+                    return shortVersion;
+                }
+                
+                // 2. 兼容性字段检测
+                String versionName = app.getString("versionName");
+                if (StringUtils.hasText(versionName)) {
+                    return versionName;
+                }
+
+                // 3. 最后退而求其次取构建版本号 (Build Number)，通常是 19 这种格式
+                return app.getString("version") != null ? app.getString("version") : "";
+            }
+        }
+        return "";
     }
 
     public static void getProcessList(String udId, Session session) {
@@ -1532,6 +1579,104 @@ private static boolean isWdaAlive(String udId) {
             return CompareVersionUtil.compareVersion(productVersion, "17.0") >= 0;
         }
         return false;
+    }
+
+    /**
+     * 通过 WDA 的 /status 接口主动获取并更新设备 IP
+     * 增加重试机制以应对端口转发建立初期的延迟 (ROI: 稳定性优化)
+     *
+     * @param udId    设备UDID
+     * @param wdaPort 本地转发端口
+     */
+    private static void updateIpViaWdaStatus(String udId, int wdaPort) {
+        IOSDeviceThreadPool.cachedThreadPool.execute(() -> {
+            int maxRetries = 3;
+            int retryGap = 2000; // 2秒重试一次
+
+            for (int i = 0; i < maxRetries; i++) {
+                try {
+                    // 给端口转发和WDA初始化预留时间
+                    Thread.sleep(retryGap);
+
+                    String url = "http://localhost:" + wdaPort + "/status";
+                    logger.info("[{}] 尝试获取设备 IP (第 {}/{} 次): {}", udId, i + 1, maxRetries, url);
+
+                    ResponseEntity<JSONObject> response = restTemplate.getForEntity(url, JSONObject.class);
+                    if (response.getStatusCode() == HttpStatus.OK && response.getBody() != null) {
+                        JSONObject value = response.getBody().getJSONObject("value");
+                        if (value != null && value.containsKey("ios")) {
+                            String ip = value.getJSONObject("ios").getString("ip");
+                            if (StringUtils.hasText(ip) && !"127.0.0.1".equals(ip) && !"::1".equals(ip)) {
+                                JSONObject detail = IOSInfoMap.getDetailMap().get(udId);
+                                if (detail != null) {
+                                    detail.put("ipAddress", ip);
+                                    logger.info("[{}] [探测成功] 设备局域网 IP 已更新为: {}", udId, ip);
+                                    return; // 成功后立即退出循环
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    logger.debug("[{}] 第 {} 次探测 IP 失败: {}", udId, i + 1, e.getMessage());
+                }
+            }
+        });
+    }
+
+    /**
+     * 从日志中提取设备IP地址并存储
+     * 采用通用的优先级竞争机制：非 169.254 (局域网) 优于 169.254 (USB 隧道)
+     *
+     * @param udId 设备UDID
+     * @param log  日志行内容
+     */
+    private static void extractIpFromLog(String udId, String log) {
+        if (log == null) {
+            return;
+        }
+
+        // 兼容传统的 ServerURLHere 标记和 JSON 格式中的该标记
+        String targetKey = "ServerURLHere->";
+        if (!log.contains(targetKey)) {
+            return;
+        }
+
+        try {
+            // 提取 http 链接部分
+            String sub = log.substring(log.indexOf(targetKey) + targetKey.length());
+            // 如果是 JSON 格式，可能带有反斜杠转义
+            sub = sub.replace("\\/", "/");
+
+            java.util.regex.Matcher matcher = SERVER_URL_PATTERN.matcher(sub);
+            if (matcher.find()) {
+                String ip = matcher.group(2);
+                // 排除本地回环地址
+                if (StringUtils.hasText(ip) && !"127.0.0.1".equals(ip) && !"localhost".equals(ip) && !"::1".equals(ip)) {
+                    JSONObject detail = IOSInfoMap.getDetailMap().get(udId);
+                    if (detail != null) {
+                        String oldIp = detail.getString("ipAddress");
+                        // 择优录取：局域网 IP 覆盖 USB 隧道 IP
+                        if (!StringUtils.hasText(oldIp) || (oldIp.startsWith("169.254") && !ip.startsWith("169.254"))) {
+                            detail.put("ipAddress", ip);
+                            logger.info("[{}] 成功捕获/更新设备 IP: {}", udId, ip);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // 静默处理
+        }
+    }
+
+    /**
+     * 获取设备IP地址
+     *
+     * @param udId 设备UDID
+     * @return IP地址
+     */
+    public static String getIpAddress(String udId) {
+        JSONObject detail = IOSInfoMap.getDetailMap().get(udId);
+        return detail != null ? detail.getString("ipAddress") : null;
     }
 
 }
