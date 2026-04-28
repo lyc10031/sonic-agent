@@ -375,7 +375,7 @@ public class AndroidDeviceBridgeTool implements ApplicationListener<ContextRefre
     /**
      * 执行ADB命令移除端口转发
      */
-    private static void executeAdbForwardRemove(IDevice device, int port) {
+    private static boolean executeAdbForwardRemove(IDevice device, int port) {
         String[] command = new String[]{
                 getADBPathFromSystemEnv(),
                 "-s", device.getSerialNumber(),
@@ -389,18 +389,27 @@ public class AndroidDeviceBridgeTool implements ApplicationListener<ContextRefre
 
             if (finished && process.exitValue() == 0) {
                 log.debug("ADB移除成功 | 设备:{} | 端口:{}", device.getSerialNumber(), port);
+                return true;
             } else {
                 if (!finished) {
                     process.destroyForcibly();
-                    log.error("ADB命令超时 | 设备:{} | 端口:{}", device.getSerialNumber(), port);
+                    log.warn("ADB命令超时 | 设备:{} | 端口:{}", device.getSerialNumber(), port);
                 } else {
-                    log.warn("ADB移除失败 | 设备:{} | 退出码:{}",
+                    log.debug("ADB移除失败 | 设备:{} | 退出码:{}",
                             device.getSerialNumber(), process.exitValue());
                 }
+                return false;
             }
         } catch (IOException | InterruptedException e) {
-            log.error("ADB命令异常 | 设备:{} | 类型:{} | 信息:{}",
-                    device.getSerialNumber(), e.getClass().getSimpleName(), e.getMessage());
+            if (e instanceof InterruptedException) {
+                log.debug("ADB命令被中断 | 设备:{} | 类型:{}",
+                        device.getSerialNumber(), e.getClass().getSimpleName());
+                Thread.currentThread().interrupt();
+            } else {
+                log.error("ADB命令异常 | 设备:{} | 类型:{} | 信息:{}",
+                        device.getSerialNumber(), e.getClass().getSimpleName(), e.getMessage());
+            }
+            return false;
         }
     }
 
@@ -426,8 +435,11 @@ public class AndroidDeviceBridgeTool implements ApplicationListener<ContextRefre
 //                        deviceId, attempt, ddmlibEx.getMessage());
 
                 // 回退到ADB命令
-                executeAdbForwardRemove(device, port);
-                if (!forwardPortMap.containsKey(mapKey)) break;
+                if (executeAdbForwardRemove(device, port)) {
+                    forwardPortMap.remove(mapKey);
+                    log.info("端口移除成功 | 设备:{} | 标识:{} | 方式:adb", deviceId, logTarget);
+                    return;
+                }
 
                 try {
                     Thread.sleep((long) Math.pow(2, attempt) * 100);
@@ -435,11 +447,9 @@ public class AndroidDeviceBridgeTool implements ApplicationListener<ContextRefre
                     Thread.currentThread().interrupt();
                     break;
                 }
-            } finally {
-                forwardPortMap.remove(mapKey); // 确保最终清理
             }
         }
-//        log.error("端口移除失败 | 设备:{} | 标识:{}", deviceId, logTarget);
+        log.warn("端口移除未确认成功 | 设备:{} | 标识:{} | 保留转发状态供后续补偿清理", deviceId, logTarget);
     }
 
     public static void removeForward(IDevice iDevice, int port, String serviceName) {

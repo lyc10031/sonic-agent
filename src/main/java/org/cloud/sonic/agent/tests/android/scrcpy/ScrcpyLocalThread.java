@@ -91,19 +91,23 @@ public class ScrcpyLocalThread extends Thread {
     @Override
     public void run() {
         File scrcpyServerFile = new File("plugins/sonic-android-scrcpy.jar");
+        log.info("[scrcpy] udId={}, pushing jar to device", udId);
         try {
             iDevice.pushFile(scrcpyServerFile.getAbsolutePath(), "/data/local/tmp/sonic-android-scrcpy.jar");
         } catch (Exception e) {
+            log.error("[scrcpy] udId={}, jar push failed: {}", udId, e.getMessage());
             e.printStackTrace();
         }
         AtomicBoolean isRetry = new AtomicBoolean(false);
+        String scrcpyVersion = "3.3.4";
+        String launchCommand = "CLASSPATH=/data/local/tmp/sonic-android-scrcpy.jar app_process / com.genymobile.scrcpy.Server " + scrcpyVersion + " log_level=info max_size=0 max_fps=60 tunnel_forward=true send_frame_meta=false send_device_meta=false send_codec_meta=false send_dummy_byte=false control=false show_touches=false stay_awake=false power_off_on_close=false clipboard_autosync=false audio=false";
+        log.info("[scrcpy] udId={}, launching server version: {}", udId, scrcpyVersion);
         try {
-            iDevice.executeShellCommand("CLASSPATH=/data/local/tmp/sonic-android-scrcpy.jar app_process / com.genymobile.scrcpy.Server 1.23 log_level=info max_size=0 max_fps=60 tunnel_forward=true send_frame_meta=false control=false show_touches=false stay_awake=false power_off_on_close=false clipboard_autosync=false",
+            iDevice.executeShellCommand(launchCommand,
                     new IShellOutputReceiver() {
                         @Override
                         public void addOutput(byte[] bytes, int i, int i1) {
                             String res = new String(bytes, i, i1);
-                            log.info(res);
                             if (res.contains("Device")) {
                                 isFinish.release();
                                 isRetry.set(true);
@@ -124,8 +128,9 @@ public class ScrcpyLocalThread extends Thread {
                         public boolean isCancelled() {
                             return false;
                         }
-                    }, 0, TimeUnit.MILLISECONDS);
+                    }, Long.MAX_VALUE, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
+            log.error("[scrcpy] udId={}, startup exception: {}", udId, e.getMessage());
             log.info("{} scrcpy service stopped.", iDevice.getSerialNumber());
             log.error(e.getMessage());
         }

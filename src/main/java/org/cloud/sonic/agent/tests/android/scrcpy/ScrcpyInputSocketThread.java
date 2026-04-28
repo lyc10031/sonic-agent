@@ -89,6 +89,7 @@ public class ScrcpyInputSocketThread extends Thread {
 
     @Override
     public void run() {
+        String udId = iDevice.getSerialNumber();
         int scrcpyPort = PortTool.getPort();
         AndroidDeviceBridgeTool.forward(iDevice, scrcpyPort, "scrcpy");
         Socket videoSocket = new Socket();
@@ -127,19 +128,21 @@ public class ScrcpyInputSocketThread extends Thread {
                             i = 5;
                         }
                     }
+                } else if (readLength == -1) {
+                    log.warn("[scrcpy] udId={}, input stream reached EOF", udId);
+                    break;
                 }
             }
         } catch (IOException e) {
+            log.error("[scrcpy] udId={}, socket error: {}", udId, e.getMessage());
             e.printStackTrace();
         } finally {
             if (scrcpyLocalThread.isAlive()) {
                 scrcpyLocalThread.interrupt();
-                log.info("scrcpy thread closed.");
             }
             if (videoSocket.isConnected()) {
                 try {
                     videoSocket.close();
-                    log.info("scrcpy video socket closed.");
                 } catch (IOException e) {
                     e.printStackTrace();
                 }
@@ -147,7 +150,6 @@ public class ScrcpyInputSocketThread extends Thread {
             if (inputStream != null) {
                 try {
                     inputStream.close();
-                    log.info("scrcpy input stream closed.");
                 } catch (IOException e) {
                     e.printStackTrace();
                 }
@@ -159,4 +161,3 @@ public class ScrcpyInputSocketThread extends Thread {
         }
     }
 }
-

@@ -55,11 +55,13 @@ public class ScrcpyServerUtil {
             s = tor;
         }
         // 启动scrcpy服务
+        logger.info("[scrcpy] udId={}, tor={}, resolvedScreen={}", udId, tor, s);
         ScrcpyLocalThread scrcpyThread = new ScrcpyLocalThread(iDevice, s, session, androidTestTaskBootThread);
         TaskManager.startChildThread(key, scrcpyThread);
 
         // 等待启动
         int wait = 0;
+        int maxWaitIterations = 8;
         while (!scrcpyThread.getIsFinish().tryAcquire()) {
             wait++;
             try {
@@ -68,7 +70,8 @@ public class ScrcpyServerUtil {
                 e.printStackTrace();
             }
             // 启动失败了，强行跳过，保证其它服务可用
-            if (wait > 8) {
+            if (wait > maxWaitIterations) {
+                logger.warn("[scrcpy] udId={}, startup not confirmed after {} iterations ({}ms), proceeding to start socket threads anyway", udId, wait, wait * 500);
                 break;
             }
         }

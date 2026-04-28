@@ -362,7 +362,11 @@ public class AndroidTouchHandler {
                     Thread.sleep(1000);
                 }
             } catch (IOException | InterruptedException e) {
-                log.info("error: {}", e.getMessage());
+                if (e instanceof InterruptedException) {
+                    log.debug("touch handler interrupted");
+                } else {
+                    log.info("touch handler error: {}", e.getMessage());
+                }
             } finally {
                 if (touchPro.isAlive()) {
                     touchPro.interrupt();
